@@ -17,3 +17,12 @@ clap = "2.33"
 serde_json = "1.0"
 pulldown-cmark = "0.5"
 pulldown-cmark-to-cmark = "1.2.3"
+
+futures-core-preview = "0.3.0-alpha.19"
+futures-util-preview = "0.3.0-alpha.19"
+
+[dependencies.tokio]
+version = "0.2.0-alpha.6"
+features = ["process", "io"]
+#tokio-process = "0.3.0-alpha.2"
+#tokio-executor = "0.2.0-alpha.6"

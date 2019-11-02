@@ -1,3 +1,5 @@
+use futures_util::future;
+use futures_util::future::{BoxFuture, FutureExt};
 use mdbook::book::{Book, Chapter};
 use mdbook::errors::Error;
 use mdbook::errors::Result;
@@ -5,7 +7,9 @@ use mdbook::preprocess::{Preprocessor, PreprocessorContext};
 use mdbook::BookItem;
 use pulldown_cmark::{Event, LinkType, Parser, Tag};
 use pulldown_cmark_to_cmark::fmt::cmark;
+use std::mem;
 use std::path::PathBuf;
+use tokio::runtime::Runtime;
 
 use crate::renderer::{CommandLineGraphviz, GraphvizRenderer};
 
@@ -13,7 +17,39 @@ pub static PREPROCESSOR_NAME: &str = "mdbook-graphviz";
 pub static INFO_STRING_PREFIX: &str = "dot process";
 
 pub struct Graphviz {
-    renderer: Box<dyn GraphvizRenderer>,
+    renderer: Box<dyn GraphvizRenderer + Sync>,
+}
+
+impl Preprocessor for Graphviz {
+    fn name(&self) -> &str {
+        PREPROCESSOR_NAME
+    }
+
+    fn run(&self, ctx: &PreprocessorContext, original_book: Book) -> Result<Book> {
+        let runtime = Runtime::new()?;
+
+        let src_dir = ctx.root.clone().join(&ctx.config.book.src);
+
+        let mut processed_book = original_book.clone();
+
+        let section_futures = mem::replace(&mut processed_book.sections, vec![])
+            .into_iter()
+            .map(|section| self.process_section(section, &src_dir));
+
+        let sections = runtime
+            .block_on(future::join_all(section_futures))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        processed_book.sections = sections;
+
+        Ok(processed_book)
+    }
+
+    fn supports_renderer(&self, _renderer: &str) -> bool {
+        // since we're just outputting markdown images, this should support any renderer
+        true
+    }
 }
 
 impl Graphviz {
@@ -24,54 +60,81 @@ impl Graphviz {
             renderer: Box::new(renderer),
         }
     }
-}
 
-impl Preprocessor for Graphviz {
-    fn name(&self) -> &str {
-        PREPROCESSOR_NAME
-    }
+    fn process_section<'a>(
+        &'a self,
+        section: BookItem,
+        src_dir: &'a PathBuf,
+    ) -> BoxFuture<'a, Result<BookItem>> {
+        if let BookItem::Chapter(original_chapter) = section {
+            let mut full_path = src_dir.join(&original_chapter.path);
 
-    fn run(&self, ctx: &PreprocessorContext, mut book: Book) -> Result<Book> {
-        let src_dir = ctx.root.clone().join(&ctx.config.book.src);
-        let mut error = Ok(());
+            // remove the chapter filename
+            full_path.pop();
 
-        book.for_each_mut(|item: &mut BookItem| {
-            // only continue editing the book if we don't have any errors
-            if error.is_ok() {
-                if let BookItem::Chapter(ref mut chapter) = item {
-                    let mut full_path = src_dir.join(&chapter.path);
+            async move {
+                // process the current chapter we're on as a leaf
+                match self
+                    .process_leaf_chapter(original_chapter, &full_path)
+                    .await
+                {
+                    Ok(mut chapter) => {
+                        // if our chapter processed, descend into any sub chapters
+                        self.process_sub_items(
+                            mem::replace(&mut chapter.sub_items, vec![]),
+                            src_dir,
+                        )
+                        .await
+                        .map(|sub_items| {
+                            chapter.sub_items = sub_items;
 
-                    // remove the chapter filename
-                    full_path.pop();
-
-                    error = self.process_chapter(chapter, &full_path)
+                            chapter
+                        })
+                    }
+                    e => e,
                 }
+                .map(BookItem::Chapter)
             }
-        });
-
-        error.map(|_| book)
+            .boxed()
+        } else {
+            future::ready(Ok(section)).boxed()
+        }
     }
 
-    fn supports_renderer(&self, _renderer: &str) -> bool {
-        // since we're just outputting markdown images, this should support any renderer
-        true
-    }
-}
+    /// Process all the sub items for a chapter
+    async fn process_sub_items(
+        &self,
+        sub_items: Vec<BookItem>,
+        src_dir: &PathBuf,
+    ) -> Result<Vec<BookItem>> {
+        let sub_futures = sub_items
+            .into_iter()
+            .map(|section| self.process_section(section, &src_dir));
 
-impl Graphviz {
-    fn process_chapter(&self, chapter: &mut Chapter, chapter_path: &PathBuf) -> Result<()> {
+        future::join_all(sub_futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Process this chapter, ignoring any potential sub_items
+    async fn process_leaf_chapter(
+        &self,
+        mut chapter: Chapter,
+        chapter_path: &PathBuf,
+    ) -> Result<Chapter> {
         let mut buf = String::with_capacity(chapter.content.len());
         let mut graphviz_block_builder: Option<GraphvizBlockBuilder> = None;
         let mut image_index = 0;
 
-        let event_results: Result<Vec<Vec<Event>>> = Parser::new(&chapter.content)
-            .map(|e| {
+        let event_futures: Vec<_> = Parser::new(&chapter.content)
+            .map(|e| -> BoxFuture<Result<Vec<Event>>> {
                 if let Some(ref mut builder) = graphviz_block_builder {
                     match e {
                         Event::Text(ref text) => {
                             builder.append_code(&**text);
 
-                            Ok(vec![])
+                            future::ready(Ok(vec![])).boxed()
                         }
                         Event::End(Tag::CodeBlock(ref info_string)) => {
                             assert_eq!(
@@ -85,11 +148,14 @@ impl Graphviz {
                             image_index += 1;
                             graphviz_block_builder = None;
 
-                            block.render_graphviz(&*self.renderer)?;
+                            let tag_events = block.tag_events();
 
-                            Ok(block.tag_events())
+                            block
+                                .render_graphviz(&*self.renderer)
+                                .map(|r| r.map(|_| tag_events))
+                                .boxed()
                         }
-                        _ => Ok(vec![]),
+                        _ => future::ready(Ok(vec![e])).boxed(),
                     }
                 } else {
                     match e {
@@ -102,23 +168,28 @@ impl Graphviz {
                                 chapter_path.clone(),
                             ));
 
-                            Ok(vec![])
+                            future::ready(Ok(vec![])).boxed()
                         }
-                        _ => Ok(vec![e]),
+                        _ => future::ready(Ok(vec![e])).boxed(),
                     }
                 }
             })
             .collect();
 
-        // get our result and combine our internal Vecs
-        let events = event_results?.into_iter().flat_map(|e| e);
+        // join all our futures back up and handle the results
+        let events = future::join_all(event_futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flat_map(|e| e);
 
         cmark(events, &mut buf, None)
             .map_err(|err| Error::from(format!("Markdown serialization failed: {}", err)))?;
 
         chapter.content = buf;
 
-        Ok(())
+        Ok(chapter)
     }
 }
 
@@ -207,10 +278,10 @@ impl GraphvizBlock {
         ]
     }
 
-    fn render_graphviz(&self, renderer: &dyn GraphvizRenderer) -> Result<()> {
+    async fn render_graphviz(self, renderer: &(dyn GraphvizRenderer + Sync)) -> Result<()> {
         let output_path = self.chapter_path.join(self.file_name());
 
-        renderer.render_graphviz(&self.code, &output_path)
+        renderer.render_graphviz(&self.code, &output_path).await
     }
 
     fn image_tag<'a, 'b>(&'a self) -> Tag<'b> {
@@ -251,8 +322,12 @@ mod test {
     struct NoopRenderer;
 
     impl GraphvizRenderer for NoopRenderer {
-        fn render_graphviz(&self, _code: &String, _output_path: &PathBuf) -> Result<()> {
-            Ok(())
+        fn render_graphviz<'a>(
+            &self,
+            _code: &'a String,
+            _output_path: &'a PathBuf,
+        ) -> BoxFuture<'a, Result<()>> {
+            async { Ok(()) }.boxed()
         }
     }
 
@@ -266,16 +341,14 @@ digraph Test {
 }
 ````"#;
 
-        let mut chapter = new_chapter(expected.into());
+        let chapter = new_chapter(expected.into());
 
-        process_chapter(&mut chapter).unwrap();
-
-        assert_eq!(expected, chapter.content);
+        assert_eq!(expected, process_chapter(chapter).unwrap().content);
     }
 
     #[test]
     fn no_name() {
-        let mut chapter = new_chapter(
+        let chapter = new_chapter(
             r#"# Chapter
 ```dot process
 digraph Test {
@@ -295,14 +368,12 @@ digraph Test {
             NORMALIZED_CHAPTER_NAME
         );
 
-        process_chapter(&mut chapter).unwrap();
-
-        assert_eq!(expected, chapter.content);
+        assert_eq!(expected, process_chapter(chapter).unwrap().content);
     }
 
     #[test]
     fn named_blocks() {
-        let mut chapter = new_chapter(
+        let chapter = new_chapter(
             r#"# Chapter
 ```dot process Graph Name
 digraph Test {
@@ -322,17 +393,58 @@ digraph Test {
             NORMALIZED_CHAPTER_NAME
         );
 
-        process_chapter(&mut chapter).unwrap();
-
-        assert_eq!(expected, chapter.content);
+        assert_eq!(expected, process_chapter(chapter).unwrap().content);
     }
 
-    fn process_chapter(chapter: &mut Chapter) -> Result<()> {
+    #[test]
+    fn multiple_blocks() {
+        let chapter = new_chapter(
+            r#"# Chapter
+```dot process Graph Name
+digraph Test {
+    a -> b
+}
+```
+
+```dot process Graph Name
+digraph Test {
+    a -> b
+}
+```
+
+```dot process Graph Name
+digraph Test {
+    a -> b
+}
+```
+"#
+            .into(),
+        );
+
+        let expected = format!(
+            r#"# Chapter
+
+![]({}_graph_name_0.generated.svg "Graph Name")
+
+![]({}_graph_name_1.generated.svg "Graph Name")
+
+![]({}_graph_name_2.generated.svg "Graph Name")
+
+"#,
+            NORMALIZED_CHAPTER_NAME, NORMALIZED_CHAPTER_NAME, NORMALIZED_CHAPTER_NAME
+        );
+
+        assert_eq!(expected, process_chapter(chapter).unwrap().content);
+    }
+
+    fn process_chapter(chapter: Chapter) -> Result<Chapter> {
+        let runtime = Runtime::new()?;
+
         let graphviz = Graphviz {
             renderer: Box::new(NoopRenderer),
         };
 
-        graphviz.process_chapter(chapter, &PathBuf::from("./"))
+        runtime.block_on(graphviz.process_leaf_chapter(chapter, &PathBuf::from("./")))
     }
 
     fn new_chapter(content: String) -> Chapter {
